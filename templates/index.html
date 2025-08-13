@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CWRV Binary Predictor</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h1>CWRV Binary Predictor</h1>
+    <button onclick="analyze()">Analyze</button>
+    <div id="results"></div>
+<script>
+function analyze(){
+    document.getElementById('results').innerHTML = "Analyzing...";
+    fetch('/analyze').then(res => res.json()).then(data => {
+        let html = "";
+        data.forEach(r => {
+            html += `<div class='card'>
+                        <h2>${r.pair}</h2>
+                        <p>Signal: ${r.signal}</p>
+                        <p>Trade: ${r.trade}</p>
+                        <p>Accuracy: ${r.accuracy}%</p>
+                        <p>CWRV: ${r.cwrv}</p>
+                        <p>Wave: ${r.wave}</p>
+                    </div>`;
+        });
+        document.getElementById('results').innerHTML = html;
+    });
+}
+</script>
+</body>
+</html>
