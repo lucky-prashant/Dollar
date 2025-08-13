@@ -1,17 +1,16 @@
-# app.py
+# app.py - robust drop-in replacement
 from flask import Flask, render_template, jsonify, request
 import requests, time, math, traceback
 from datetime import datetime
-import pytz
-import os
+import pytz, os
 
 app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
-API_KEY = "b7ea33d435964da0b0a65b1c6a029891"  # your key
+API_KEY = "b7ea33d435964da0b0a65b1c6a029891"
 PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "EUR/JPY", "AUD/USD"]
 INTERVAL = "5min"
-OUTPUTSIZE = 200            # initial full fetch size
+OUTPUTSIZE = 200
 LOCAL_TZ = pytz.timezone("Asia/Kolkata")
 
 # ZigZag / ATR params
@@ -29,60 +28,65 @@ SIDEWAYS_BARS = 12
 SIDEWAYS_OVERLAP_COUNT = 7
 
 # Backtest accuracy
-BACKTEST_SIGNALS = 40
+BACKTEST_SIGNALS = 30
 
-# Cache + incremental update fields
-_cache = {
-    "candles": {},   # symbol -> list of candles (oldest->newest)
-    "last_dt": {},   # symbol -> last candle datetime str
-    "last_fetch": {} # symbol -> timestamp
-}
-CACHE_TTL = 15  # seconds (short) to avoid rapid repeated calls
+# Cache
+CACHE_TTL = 20
+_cache = {"candles": {}, "ts": {}}
 
-# ---------------- Helpers ----------------
-def log(msg):
+# ---------------- Logging helper ----------------
+def log(s):
     try:
-        print(f"[{datetime.now().isoformat()}] {msg}")
+        print(f"[{datetime.utcnow().isoformat()}] {s}")
     except Exception:
         pass
 
-def safe_request_get(url, params=None, timeout=10):
+# ---------------- HTTP helper ----------------
+def http_get(url, params=None, timeout=10):
     try:
         return requests.get(url, params=params, timeout=timeout)
     except Exception as e:
-        log(f"HTTP get failed: {e}")
+        log(f"http_get error: {e}")
         return None
 
-# ---------------- Candle fetch & incremental merge ----------------
-def fetch_recent_candles(symbol, interval=INTERVAL, outputsize=100):
+# ---------------- Candles ----------------
+def fetch_candles(symbol, interval=INTERVAL, outputsize=OUTPUTSIZE):
     """
-    Fetch recent candles from Twelve Data. Returns oldest->newest list or None.
+    Get candles from TwelveData. Returns oldest->newest list or None.
     """
     try:
+        now = time.time()
+        # short cache
+        cached = _cache["candles"].get(symbol)
+        ts = _cache["ts"].get(symbol, 0)
+        if cached and (now - ts) < CACHE_TTL:
+            return cached
+
         base = "https://api.twelvedata.com/time_series"
         params = {
             "symbol": symbol,
             "interval": interval,
             "outputsize": outputsize,
             "apikey": API_KEY,
-            "format": "JSON"
+            "format": "JSON",
         }
-        r = safe_request_get(base, params=params, timeout=12)
+        r = http_get(base, params=params, timeout=10)
         if r is None:
             return None
         data = r.json()
+        # fallback without slash if API expects that
         if "values" not in data:
-            # fallback try without slash
             alt = symbol.replace("/", "")
             if alt != symbol:
                 params["symbol"] = alt
-                r = safe_request_get(base, params=params, timeout=12)
+                r = http_get(base, params=params, timeout=10)
                 if r is None:
                     return None
                 data = r.json()
         if "values" not in data:
-            log(f"fetch error for {symbol}: {data}")
+            log(f"fetch_candles: no 'values' for {symbol} -> {data}")
             return None
+
         raw = list(reversed(data["values"]))  # oldest -> newest
         candles = []
         for v in raw:
@@ -96,60 +100,17 @@ def fetch_recent_candles(symbol, interval=INTERVAL, outputsize=100):
                 })
             except Exception:
                 continue
+
+        if not candles:
+            return None
+        _cache["candles"][symbol] = candles
+        _cache["ts"][symbol] = now
         return candles
     except Exception as e:
-        log(f"fetch_recent_candles exception for {symbol}: {e}")
+        log(f"fetch_candles exception {symbol}: {e}")
         return None
 
-def get_candles(symbol):
-    """
-    Return cached candles if fresh; otherwise perform incremental merge:
-    - If no cached data: fetch OUTPUTSIZE and cache.
-    - If cached and last candle datetime different: fetch recent (100) and merge new.
-    Guaranteed to return a list (maybe shorter) or None on failure.
-    """
-    try:
-        now = time.time()
-        last_ts = _cache["last_fetch"].get(symbol, 0)
-        if symbol in _cache["candles"] and (now - last_ts) < CACHE_TTL:
-            return _cache["candles"][symbol]
-
-        if symbol not in _cache["candles"]:
-            # initial fetch
-            candles = fetch_recent_candles(symbol, outputsize=OUTPUTSIZE)
-            if candles:
-                _cache["candles"][symbol] = candles
-                _cache["last_dt"][symbol] = candles[-1]["t"] if candles else None
-                _cache["last_fetch"][symbol] = now
-                return candles
-            else:
-                return None
-        else:
-            # incremental update: fetch recent 100 and append only new candles by datetime
-            recent = fetch_recent_candles(symbol, outputsize=100)
-            if not recent:
-                _cache["last_fetch"][symbol] = now
-                return _cache["candles"].get(symbol)
-            cached = _cache["candles"][symbol]
-            cached_dt_set = {c["t"] for c in cached}
-            appended = 0
-            for c in recent:
-                if c["t"] not in cached_dt_set:
-                    cached.append(c)
-                    appended += 1
-            # keep size bounded
-            if len(cached) > OUTPUTSIZE * 2:
-                cached = cached[-OUTPUTSIZE:]
-            _cache["candles"][symbol] = cached
-            _cache["last_dt"][symbol] = cached[-1]["t"] if cached else None
-            _cache["last_fetch"][symbol] = now
-            log(f"{symbol}: merged {appended} new candles")
-            return cached
-    except Exception as e:
-        log(f"get_candles error {symbol}: {e}")
-        return None
-
-# ---------------- Indicators / utilities ----------------
+# ---------------- Simple indicators ----------------
 def compute_atr(highs, lows, closes, period=ATR_PERIOD):
     try:
         if len(closes) < 2: return 0.0
@@ -163,26 +124,27 @@ def compute_atr(highs, lows, closes, period=ATR_PERIOD):
     except Exception:
         return 0.0
 
-# ATR-based zigzag swing finder
+# ---------------- ZigZag swings ----------------
 def zigzag_swings(candles, atr_mult=ZZ_ATR_MULT, max_keep=MAX_SWINGS):
     try:
         n = len(candles)
         if n < ATR_PERIOD + 3:
             return []
         highs = [c["h"] for c in candles]
-        lows  = [c["l"] for c in candles]
-        closes= [c["c"] for c in candles]
+        lows = [c["l"] for c in candles]
+        closes = [c["c"] for c in candles]
         a = compute_atr(highs, lows, closes, ATR_PERIOD)
-        if a <= 0: return []
-        threshold = a * atr_mult
+        if a <= 0:
+            return []
 
+        threshold = a * atr_mult
         swings = []
         direction = None
         cur_peak = highs[0]; cur_peak_idx = 0
         cur_trough = lows[0]; cur_trough_idx = 0
 
         for i in range(1, n):
-            h = highs[i]; l = lows[i]
+            h, l = highs[i], lows[i]
             if h >= cur_peak:
                 cur_peak = h; cur_peak_idx = i
             if l <= cur_trough:
@@ -213,7 +175,7 @@ def zigzag_swings(candles, atr_mult=ZZ_ATR_MULT, max_keep=MAX_SWINGS):
         elif direction == "down":
             swings.append({"idx": cur_trough_idx, "type": "L", "price": cur_trough, "time": candles[cur_trough_idx]["t"]})
 
-        # dedupe & sort
+        # dedupe and sort
         unique = {}
         for s in swings:
             unique[(s["idx"], s["type"])] = s
@@ -223,12 +185,13 @@ def zigzag_swings(candles, atr_mult=ZZ_ATR_MULT, max_keep=MAX_SWINGS):
         log(f"zigzag error: {e}")
         return []
 
+# ---------------- Market structure ----------------
 def market_structure(swings):
     try:
         if len(swings) < 5:
-            return "sideways", "not enough swings"
+            return "sideways", "few swings"
         highs = [s for s in swings if s["type"] == "H"]
-        lows  = [s for s in swings if s["type"] == "L"]
+        lows = [s for s in swings if s["type"] == "L"]
         if len(highs) >= 3 and len(lows) >= 3:
             if highs[-3]["price"] < highs[-2]["price"] < highs[-1]["price"] and lows[-3]["price"] < lows[-2]["price"] < lows[-1]["price"]:
                 return "up", "HH & HL"
@@ -239,14 +202,17 @@ def market_structure(swings):
         log(f"market_structure error: {e}")
         return "sideways", "error"
 
+# ---------------- Patterns ----------------
 def detect_pattern(candles):
     try:
         if not candles or len(candles) < 2: return None
         a, b = candles[-2], candles[-1]
+        # engulfing
         if a["c"] < a["o"] and b["c"] > b["o"] and b["c"] > a["o"]:
             return "bullish_engulf"
         if a["c"] > a["o"] and b["c"] < b["o"] and b["c"] < a["o"]:
             return "bearish_engulf"
+        # pin
         body = abs(b["c"] - b["o"])
         up_wick = b["h"] - max(b["c"], b["o"])
         lo_wick = min(b["c"], b["o"]) - b["l"]
@@ -274,7 +240,7 @@ def sideways_filter(candles):
     except Exception:
         return False
 
-# ---------------- Elliott (heuristic) ----------------
+# ---------------- Elliott heuristic ----------------
 def elliott_wave_label(swings):
     try:
         if len(swings) < 5: return "unknown"
@@ -303,9 +269,6 @@ def elliott_wave_label(swings):
 
 # ---------------- CWRV 1-2-3 ----------------
 def find_123_points_from_swings(swings, lookback=8):
-    """
-    Find L-H-L or H-L-H in last `lookback` swings; return p1,p2,p3 or (None, None, None).
-    """
     try:
         if len(swings) < 3: return None, None, None, "not enough swings"
         start = max(0, len(swings) - lookback)
@@ -334,14 +297,13 @@ def validate_123(p1, p2, p3, candles, trend):
         fib = fib_retrace(p1["price"], p2["price"], p3["price"])
         if not (FIB_MIN <= fib <= FIB_MAX): return False, f"fib {fib:.3f} outside"
         last = candles[-1]
-        # require breakout beyond p2
         if trend == "up":
             if last["c"] <= p2["price"]: return False, "no breakout above p2"
         elif trend == "down":
             if last["c"] >= p2["price"]: return False, "no breakout below p2"
         body = abs(last["c"] - last["o"])
         rng = last["h"] - last["l"] if last["h"] - last["l"] > 0 else 1e-9
-        if (body / rng) < MIN_BODY_PERCENT: return False, "breakout body too small"
+        if (body / rng) < MIN_BODY_PERCENT: return False, f"body too small {body/rng:.2f}"
         if (len(candles) - p3["idx"]) > 40: return False, "p3 too old"
         return True, f"fib={fib:.3f}; body={body/rng:.2f}"
     except Exception as e:
@@ -384,14 +346,14 @@ def analyze_pair(symbol):
         "why": ""
     }
     try:
-        candles = get_candles(symbol)
+        candles = fetch_candles(symbol)
         if not candles or len(candles) < 30:
             out["why"] = "insufficient data"
             return out
 
         out["candles"] = candles[-60:]
         swings = zigzag_swings(candles)
-        trend, t_reason = market_structure(swings)
+        trend, tr = market_structure(swings)
         is_sideways = sideways_filter(candles)
         p1,p2,p3,findmsg = find_123_points_from_swings(swings)
         valid, valmsg = validate_123(p1,p2,p3,candles,trend) if (p1 and p2 and p3) else (False, findmsg)
@@ -399,7 +361,6 @@ def analyze_pair(symbol):
         wave = elliott_wave_label(swings)
         accuracy = backtest_accuracy(candles, swings, trend)
 
-        # confidence scoring
         conf = 0
         if valid: conf += 60
         if pat in ("bullish_engulf", "pin_bottom") and trend == "up": conf += 10
@@ -409,7 +370,6 @@ def analyze_pair(symbol):
         conf += int((accuracy - 70) * 0.3)
         conf = max(0, min(100, int(round(conf))))
 
-        # decide final signal/status
         if trend == "up" and valid and not is_sideways:
             signal = "CALL"
         elif trend == "down" and valid and not is_sideways:
@@ -434,7 +394,7 @@ def analyze_pair(symbol):
             "cwrv": "Yes" if valid else "No",
             "cwrv_conf": conf,
             "wave": wave,
-            "why": f"trend={trend} ({t_reason}); find={findmsg}; validate={valmsg}; pat={pat}; swings={len(swings)}"
+            "why": f"trend={trend} ({tr}); find={findmsg}; validate={valmsg}; pat={pat}; swings={len(swings)}"
         })
         return out
     except Exception as e:
@@ -448,27 +408,41 @@ def index():
     try:
         return render_template("index.html", pairs=PAIRS)
     except Exception:
-        return "<h1>CWRV Binary Predictor</h1><p>Use /analyze</p>"
+        return "<h1>CWRV App</h1><p>Use /analyze</p>"
 
 @app.route("/analyze", methods=["GET"])
 def analyze():
     try:
-        symbols = request.args.getlist("pair") or PAIRS
         results = []
-        for s in symbols:
+        for s in PAIRS:
             res = analyze_pair(s)
-            if not isinstance(res, dict):
-                res = {"pair": s, "signal": "SIDEWAYS", "status": "NO TRADE", "accuracy": 100, "cwrv": "No", "wave": "unknown", "why": "invalid result"}
-            results.append(res)
+            results.append(res if isinstance(res, dict) else {"pair": s, "signal": "SIDEWAYS", "status": "NO TRADE", "accuracy": 100, "cwrv": "No", "wave": "unknown", "why": "invalid"})
         return jsonify({"results": results})
     except Exception as e:
-        log(f"/analyze handler error: {e}\n{traceback.format_exc()}")
+        log(f"/analyze error: {e}\n{traceback.format_exc()}")
         return jsonify({"results": [], "error": str(e)}), 500
+
+# Debug: expose swings and p1/p2/p3 for a pair
+@app.route("/debug", methods=["GET"])
+def debug():
+    pair = request.args.get("pair", PAIRS[0])
+    try:
+        candles = fetch_candles(pair)
+        if not candles:
+            return jsonify({"error": "no data"})
+        swings = zigzag_swings(candles)
+        p1,p2,p3,findmsg = find_123_points_from_swings(swings)
+        return jsonify({
+            "pair": pair,
+            "swings": swings,
+            "p1": p1, "p2": p2, "p3": p3,
+            "find": findmsg
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "trace": traceback.format_exc()})
 
 # ---------------- Run ----------------
 if __name__ == "__main__":
-    try:
-        port = int(os.environ.get("PORT", 5000))
-        app.run(host="0.0.0.0", port=port, debug=False)
-    except Exception as e:
-        log(f"Failed to start: {e}")
+    port = int(os.environ.get("PORT", 5000))
+    log(f"Starting app on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
