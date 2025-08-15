@@ -1,31 +1,151 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html>
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CWRV 1-2-3 Binary Assistant</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <meta charset="utf-8" />
+  <title>CWRV Predictor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body{font-family: Arial, Helvetica, sans-serif; margin:16px; background:#f6f7fb; color:#111}
+    .top{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+    button{padding:8px 12px;border-radius:6px;border:1px solid #bbb;background:#fff;cursor:pointer}
+    .grid{display:flex;gap:12px;flex-wrap:wrap}
+    .box{background:#fff;border-radius:8px;padding:12px;flex:1 1 200px;min-width:200px;box-shadow:0 2px 6px rgba(0,0,0,0.06)}
+    .pair{font-weight:700;margin-bottom:6px}
+    .signal{font-weight:700;padding:6px;border-radius:6px;display:inline-block;margin-bottom:6px}
+    .green{background:#e6f7ed;color:#0a6d2f}
+    .red{background:#ffe6e6;color:#8a1e1e}
+    .side{background:#fff3cd;color:#7a5f00;border:1px solid #fde3a7}
+    .candle{width:70px;height:70px;border-radius:4px;margin-bottom:6px;position:relative;border:1px solid #eee}
+    .body{position:absolute;left:25px;width:20px;}
+    .info{font-size:12px;color:#333}
+    .muted{font-size:12px;color:#666;margin-top:6px}
+  </style>
 </head>
 <body>
-  <header>
-    <h1>CWRV 1-2-3 Binary Assistant</h1>
-    <p class="sub">Pairs: EUR/USD · GBP/USD · USD/JPY · EUR/JPY · AUD/USD (5-min)</p>
-  </header>
+  <div class="top">
+    <h2 style="margin:0">CWRV Predictor</h2>
+    <button id="analyzeBtn">Analyze</button>
+    <div id="lastRun" class="muted">Never</div>
+  </div>
 
-  <main>
-    <div class="controls">
-      <button id="analyzeBtn">Analyze</button>
-      <span id="statusText"></span>
-    </div>
+  <div class="grid" id="grid">
+    <!-- boxes will be injected here -->
+  </div>
 
-    <section id="cards" class="cards"></section>
-  </main>
+<script>
+const PAIRS = {{ pairs|tojson }};
+function createBox(pair){
+  const el = document.createElement('div'); el.className='box'; el.id='box-'+pair.replace('/','_');
+  el.innerHTML = `
+    <div class="pair">${pair}</div>
+    <div class="signal side" id="sig-${pair.replace('/','_')}">--</div>
+    <div class="candle" id="cndl-${pair.replace('/','_')}"></div>
+    <div class="info" id="info-${pair.replace('/','_')}"></div>
+    <div class="muted" id="why-${pair.replace('/','_')}"></div>
+  `;
+  return el;
+}
 
-  <footer>
-    <a href="/health" target="_blank">Health</a> ·
-    <a href="/debug" target="_blank">Debug</a>
-  </footer>
+function drawSimpleCandle(container, candle){
+  // clear
+  container.innerHTML = '';
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  const o = candle.o, c = candle.c, high = candle.h, low = candle.l;
+  const isBull = c >= o;
+  // scale to box
+  const range = Math.max(high - low, 1e-6);
+  const scale = (h - 10) / range;
+  const topY = (high - Math.max(c,o)) * scale + 4;
+  const bodyH = Math.max(Math.abs(c - o) * scale, 4);
+  const left = (w/2) - 10;
+  // wick
+  const wick = document.createElement('div');
+  wick.style.position='absolute';
+  wick.style.left = (w/2 - 1) + 'px';
+  wick.style.width = '2px';
+  wick.style.top = ((high - high) * scale + 4) + 'px';
+  wick.style.height = ((high - low) * scale) + 'px';
+  wick.style.background = '#444';
+  container.appendChild(wick);
+  // body
+  const body = document.createElement('div');
+  body.className='body';
+  body.style.left = left+'px';
+  body.style.top = topY + 'px';
+  body.style.height = bodyH + 'px';
+  body.style.width = '18px';
+  body.style.borderRadius='2px';
+  body.style.background = isBull ? '#0a6d2f' : '#8a1e1e';
+  container.appendChild(body);
+}
 
-  <script src="/static/script.js"></script>
+function updateGrid(results){
+  for(const r of results){
+    const key = r.pair.replace('/','_');
+    const sigEl = document.getElementById('sig-'+key);
+    const infoEl = document.getElementById('info-'+key);
+    const whyEl = document.getElementById('why-'+key);
+    const cndlEl = document.getElementById('cndl-'+key);
+    if(!sigEl) continue;
+    // signal color
+    if(r.signal === 'CALL'){
+      sigEl.className='signal green';
+      sigEl.textContent = 'CALL';
+    } else if(r.signal === 'PUT'){
+      sigEl.className='signal red';
+      sigEl.textContent = 'PUT';
+    } else {
+      sigEl.className='signal side';
+      sigEl.textContent = 'SIDEWAYS';
+    }
+    // info: status, accuracy
+    infoEl.innerHTML = `<b>${r.status}</b> • accuracy:${r.accuracy}% • cwrv:${r.cwrv} (${r.cwrv_conf})`;
+    whyEl.textContent = r.why;
+    // last candle
+    if(r.last_candle){
+      drawSimpleCandle(cndlEl, r.last_candle);
+    } else if(r.candles && r.candles.length){
+      drawSimpleCandle(cndlEl, r.candles[r.candles.length-1]);
+    }
+  }
+}
+
+function showBoxes(){
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  for(const p of PAIRS){
+    grid.appendChild(createBox(p));
+  }
+}
+async function analyze(){
+  const btn = document.getElementById('analyzeBtn');
+  btn.disabled = true;
+  btn.textContent = 'Analyzing...';
+  try{
+    const resp = await fetch('/analyze');
+    const data = await resp.json();
+    if(data.results){
+      updateGrid(data.results);
+    } else {
+      alert('No results');
+    }
+    const now = new Date();
+    document.getElementById('lastRun').textContent = 'Last: ' + now.toLocaleString();
+  }catch(err){
+    console.error(err);
+    alert('Error: ' + err);
+  }finally{
+    btn.disabled = false;
+    btn.textContent = 'Analyze';
+  }
+}
+
+document.getElementById('analyzeBtn').addEventListener('click', analyze);
+
+showBoxes();
+// optional: auto-run once on load
+// analyze();
+</script>
 </body>
 </html>
